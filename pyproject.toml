@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ovpn3"
-version = "0.1.0"
+version = "0.1.1"
 description = "OpenVPN3 CLI"
 authors = ["Janusz Skonieczny <pypi@wooyek.com>"]
 license = "GNU Affero General Public License"
@@ -15,6 +15,7 @@ click-log = "^0.3.2"
 backoff = "^1.11.1"
 xdg = "^5.1.1"
 keyring = "^23.4.0"
+cryptography = "^36.0.1"
 
 [tool.poetry.dev-dependencies]
 pytest = "^5.2"

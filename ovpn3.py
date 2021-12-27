@@ -1,11 +1,9 @@
 #!/usr/bin/python3
-
-import json
+import base64
 import logging
 import time
+from dataclasses import dataclass
 from getpass import getpass
-from itertools import count
-from pathlib import Path
 
 import backoff as backoff
 import click
@@ -13,165 +11,163 @@ import click_log
 import dbus
 import keyring
 import openvpn3
-import xdg
-
+from cryptography.hazmat.primitives.hashes import SHA1
+from cryptography.hazmat.primitives.twofactor.totp import TOTP
 
 log = logging.getLogger(__name__)
 click_log.basic_config(log)
 
 
-def get_cfg_path():
-    return xdg.xdg_config_home() / 'pyoepnvpn3.json'
+@dataclass(frozen=True)
+class CredentialsService:
+    profile: str
+    username: str
+
+    @property
+    def service_name(self):
+        return f'openvpn-{self.profile}'
+
+    def save_password(self, password):
+        keyring.set_password(self.service_name, self.username, password)
+
+    def get_password(self):
+        return keyring.get_password(self.service_name, self.username)
+
+    def save_totp_key(self, key):
+        keyring.set_password(self.service_name, 'totp', key)
+
+    def get_totp_code(self):
+        key = keyring.get_password(self.service_name, 'totp')
+        encoded_key = base64.b32decode(key, casefold=True)
+        totp = TOTP(encoded_key, 6, SHA1(), 30, enforce_key_length=False)
+        return totp.generate(time.time())
 
 
-def get_cfg():
-    path = get_cfg_path()
-    if not path.exists():
-        return {}
-    with path.open('r') as f:
-        return json.load(f)
+class SessionProvider:
+    def __init__(self) -> None:
+        bus: dbus.SystemBus = dbus.SystemBus()
+        self.configuration_manager = openvpn3.ConfigurationManager(bus)
+        self.session_manager = openvpn3.SessionManager(bus)
 
+    def __call__(self, profile: str):
+        session = self.get_session(profile)
+        if session is None:
+            session = self.session_manager.NewTunnel(self.get_config(profile))
 
-def save_configuration(name, user, path):
-    cfg = get_cfg()
-    cfg[f'{name}'] = {
-        'user': user,
-        'path': path,
-    }
-    log.debug("cfg: %s", cfg)
-    path = get_cfg_path()
-    log.debug("Saving configuration: %s", path)
-    with path.open('w') as f:
-        return json.dump(cfg, f, indent=2, sort_keys=True)
-
-
-def get_configuration(cfg_name):
-    cfg = get_cfg().get(cfg_name, {})
-    username = cfg.get('user', None)
-    path = cfg.get('path', None)
-    if not cfg or not (all((username, path))):
-        raise ValueError(f'Missing configuration for {cfg_name}: {cfg}')
-    print(f'---> cfg {cfg}')
-    return username, Path(path)
-
-
-def get_service_name(cfg_name):
-    return f'openvpn-{cfg_name}'
-
-
-def save_credentials(cfg_name, username, password):
-    service_name = get_service_name(cfg_name)
-    keyring.set_password(service_name, username, password)
-
-
-def get_password(cfg_name, username):
-    service_name = get_service_name(cfg_name)
-    return keyring.get_password(service_name, username)
-
-
-class VPN:
-
-    def __init__(self, name: str, user: str, path: Path) -> None:
-        self.user = user
-        self.name = name
-        self.path = path
-        self.bus: dbus.SystemBus = dbus.SystemBus()
-        self.config = self.get_vpn_cfg()
-
-    def get_vpn_cfg(self):
-        # Get a connection to the openvpn3-service-configmgr service
-        # and import the configuration
-        cm = openvpn3.ConfigurationManager(self.bus)
-        names = cm.LookupConfigName(self.name)
-
-        if len(names) > 0:
-            cfg = cm.Retrieve(names[0])
-        else:
-            # cmdparser = openvpn3.ConfigParser(), __file__)
-            # cmdparser.SanityCheck()
-            cfg = cm.Import(self.name, self.path.read_text(), False, False)
-
-        log.debug("Configuration D-Bus path: " + cfg.GetPath())
-        return cfg
-
-    def get_session(self):
-        # Get a connection to the openvpn3-service-sessionmgr service
-        # and start a new tunnel with the just imported config profile
-        sm = openvpn3.SessionManager(self.bus)
-        sessions = sm.LookupConfigName(self.name)
-        if len(sessions) > 4:
-            log.debug("sessions: %s", sessions)
-            session = sm.Retrieve(sessions[0])
-        else:
-            session = sm.NewTunnel(self.config)
         log.debug("session: %s", session)
         log.debug("Session D-Bus path: " + session.GetPath())
         return session
+
+    def get_config(self, profile: str):
+        configurations = self.configuration_manager.LookupConfigName(profile)
+
+        if len(configurations) < 1:
+            log.info(
+                "Please setup a persistent session:\n"
+                "openvpn3 config-import --persistent --name {profile} --config <client.ovpn>"
+            )
+            raise Exception(f'Missing configuration for {profile}')
+
+        return self.configuration_manager.Retrieve(configurations[0])
+
+    def get_session(self, profile: str):
+        sessions = self.session_manager.LookupConfigName(profile)
+        if len(sessions) > 0:
+            log.debug("Sessions: %s", sessions)
+            return self.session_manager.Retrieve(sessions[0])
+
+
+class VPN:
+    def __init__(self, profile: str) -> None:
+        self.session = SessionProvider()(profile=profile)
 
     @backoff.on_exception(
         wait_gen=backoff.expo,
         exception=dbus.exceptions.DBusException,
         max_tries=8,
     )
-    def get_status(self, session):
+    def check_status(self):
         # Wait for the backends to settle
         # The GetStatus() method will throw an exception
         # if the backend is not yet ready
-        status = session.GetStatus()
+        status = self.session.GetStatus()
         log.debug("Status: %s", status)
         return status
 
-    def authenticate(self, session):
-        slots = session.FetchUserInputSlots()
-        log.info(f'Sending user: {self.user}')
-        slots[0].ProvideInput(self.user)
-        log.info(f'Sending password: ***')
-        password = get_password(cfg_name=self.name, username=self.user)
-        slots[1].ProvideInput(password)
+    def authenticate(self, credentials_service: CredentialsService):
+        slots = self.session.FetchUserInputSlots()
+        log.debug("Input slots: %s", slots)
+        for slot in slots:
+            log.debug("Slot: %s", slot)
+            variable_name = slot.GetVariableName()
+            if variable_name == 'username':
+                username = credentials_service.username
+                log.info(f'Sending user: {username}')
+                slot.ProvideInput(username)
 
-    def mfa(self, session):
-        slot = session.FetchUserInputSlots()[0]
-        label = slot.GetLabel()
-        slot.ProvideInput(input(f'{label}: '))
-        # TODO: use pyotp here
+            if variable_name == 'password':
+                log.info(f'Sending password: ***')
+                password = credentials_service.get_password()
+                slot.ProvideInput(password)
 
-    def connect(self):
-        session = self.get_session()
-        self.get_status(session)
+    @backoff.on_predicate(wait_gen=backoff.expo, max_tries=8)
+    def mfa(self, credentials_service: CredentialsService):
+        self.check_status()
+        slots = self.session.FetchUserInputSlots()
+        log.debug("Slots: %s", slots)
+        if len(slots) < 1:
+            log.debug(f'MFA prompt not present')
+            return False
+
+        slot = slots[0]
+        log.debug("Slot: %s", slot)
+        code = credentials_service.get_totp_code()
+        if code is not None:
+            log.debug(f'Sending TOTP code {code}')
+            slot.ProvideInput(code)
+        else:
+            label = slot.GetLabel()
+            slot.ProvideInput(input(f'{label}: '))
+
+        return True
+
+    @backoff.on_predicate(wait_gen=backoff.expo, max_tries=8)
+    def wait_for_connection(self):
+        status = self.check_status()
+        if status['minor'] == openvpn3.StatusMinor.CONN_AUTH_FAILED:
+            self.disconnect()
+            return True
+
+        if status['minor'] == openvpn3.StatusMinor.CONN_CONNECTED:
+            log.info("Connected...")
+            return True
+
+    def connect(self, credentials_service: CredentialsService):
+        self.check_status()
 
         try:
-            session.Ready()
+            self.session.Ready()
         except dbus.exceptions.DBusException as e:
             if not str(e).endswith('Missing user credentials'):
                 raise e
 
-            self.get_status(session)
-            self.authenticate(session=session)
+            self.check_status()
+            self.authenticate(credentials_service=credentials_service)
 
-        session.Ready()
-        session.Connect()
+        self.check_status()
+        self.session.Ready()
+        self.session.Connect()
 
-        for n in count():
-            log.debug(f'[{n}] Waiting for MFA prompt')
-            status = self.get_status(session)
-            slots = session.FetchUserInputSlots()
-            if len(slots) > 0:
-                self.mfa(session)
-                session.Ready()
-                session.Connect()
-                log.info("Connected...")
-                return
-            sec = 0.5
-            sec = sec + n * 0.5 if sec < 5 else sec
-            log.debug("Waiting: %s", sec)
-            time.sleep(sec)
-            if n > 10:
-                raise Exception("MFA prompt was not requested")
+        self.check_status()
+        self.mfa(credentials_service=credentials_service)
+
+        self.session.Ready()
+        self.session.Connect()
+        self.wait_for_connection()
 
     def disconnect(self):
-        session = self.get_session()
-        self.get_status(session)
-        session.Disconnect()
+        self.check_status()
+        self.session.Disconnect()
 
 
 @click.group(name='pyopenvpn3')
@@ -184,43 +180,44 @@ def main(ctx, config={}):
 
 
 @click.command()
-@click.argument('name', required=True)
-@click.argument('path', required=True)
-@click.argument('user', required=True)
+@click.argument('profile', required=True)
+@click.argument('username', required=True)
 @click.pass_context
-def setup(ctx, name, path, user):
-    """Save credentials and sesssion configuration"""
-    save_configuration(name=name, user=user, path=path)
-    save_credentials(cfg_name=name, username=user, password=getpass(f'Password for {user}: '))
+def setup(ctx, username, profile):
+    """Save credentials for a give profile"""
+    service = CredentialsService(profile, username)
+    service.save_password(password=getpass(f'Password for {username}: '))
+    if input("Do you want to store TOTP key for automatic MFA authentication? [N/y]") == 'y':
+        service.save_totp_key(key=getpass(f'TOTP key for {username}: '))
 
 
 @click.command()
-@click.argument('name', required=True)
+@click.argument('profile', required=True)
+@click.argument('username', required=True)
 @click.pass_context
-def connect(ctx, name):
+def connect(ctx, username, profile):
     """Connect VPN session"""
-    user, path = get_configuration(cfg_name=name)
-    vpn = VPN(name=name, user=user, path=path)
+    credentials_service = CredentialsService(profile, username)
+    vpn = VPN(profile=profile)
     try:
-        vpn.connect()
+        vpn.connect(credentials_service=credentials_service)
     except Exception as ex:
         vpn.disconnect()
         raise ex
 
 
 @click.command()
-@click.argument('name', required=True)
+@click.argument('profile', required=True)
 @click.pass_context
-def disconnect(ctx, name):
-    """Connect VPN session"""
-    user, path = get_configuration(cfg_name=name)
-    vpn = VPN(name=name, user=user, path=path)
+def disconnect(ctx, profile):
+    """Disconnect VPN session"""
+    vpn = VPN(profile)
     vpn.disconnect()
 
 
 main.add_command(setup)
 main.add_command(connect)
-# main.add_command(disconnect)
+main.add_command(disconnect)
 
 if __name__ == "__main__":
     main(obj={})
