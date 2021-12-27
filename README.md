@@ -32,6 +32,14 @@ OpenVPN 3 CLI for automatic session start with credentials read from os keyring
 
 This is still an alpha version with no support. 
 
+## Troubleshooting
+
+Run your commands with DEBUG verbosity:
+
+```bash
+ovpn3 -v DEVBUG <cmd>
+```
+
 ## Known issues
 
 ### Resolv conf is not being restored after disconnection
