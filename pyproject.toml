@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ovpn3"
-version = "0.1.2"
+version = "0.1.3"
 description = "OpenVPN3 CLI"
 authors = ["Janusz Skonieczny <pypi@wooyek.com>"]
 license = "GNU Affero General Public License"

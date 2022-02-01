@@ -13,6 +13,7 @@ import keyring
 import openvpn3
 from cryptography.hazmat.primitives.hashes import SHA1
 from cryptography.hazmat.primitives.twofactor.totp import TOTP
+from cryptography.hazmat.backends import default_backend
 
 log = logging.getLogger(__name__)
 click_log.basic_config(log)
@@ -39,7 +40,14 @@ class CredentialsService:
     def get_totp_code(self):
         key = keyring.get_password(self.service_name, 'totp')
         encoded_key = base64.b32decode(key, casefold=True)
-        totp = TOTP(encoded_key, 6, SHA1(), 30, enforce_key_length=False)
+        totp = TOTP(
+            key=encoded_key,
+            length=6,
+            algorithm=SHA1(),
+            time_step=30,
+            backend=default_backend(),
+            enforce_key_length=False,
+        )
         return totp.generate(time.time())
 
 
@@ -87,9 +95,6 @@ class VPN:
         max_tries=8,
     )
     def check_status(self):
-        # Wait for the backends to settle
-        # The GetStatus() method will throw an exception
-        # if the backend is not yet ready
         status = self.session.GetStatus()
         log.debug("Status: %s", status)
         return status
@@ -146,6 +151,9 @@ class VPN:
         self.check_status()
 
         try:
+            # Wait for the backends to settle
+            # The GetStatus() method will throw an exception
+            # if the backend is not yet ready
             self.session.Ready()
         except dbus.exceptions.DBusException as e:
             if not str(e).endswith('Missing user credentials'):
